@@ -58,6 +58,14 @@ CLASS_THRESHOLDS = {"healthy": 0.35, "yld": 0.35}
 COUNT_CORRECTION = {"healthy": 2.538, "yld": 1.555}
 
 IOU_THRESHOLD = 0.50
+
+# Out-of-domain gate. The detector never saw non-plantation images in training,
+# so on a photo of a person it still returns its 300 best guesses. These checks
+# reject such uploads BEFORE any count or YLD percentage is reported.
+# Tune on a handful of real drone frames and a handful of junk images.
+MIN_VEGETATION_FRACTION = 0.30   # share of pixels that are green/yellow-green
+MIN_DETECTIONS = 1               # raise once thresholds are recalibrated for YOLO26
+MAX_MEDIAN_BOX_AREA = 1.00       # disabled: close-up frames can have one palm filling 20-60% of the image
 INPUT_SIZE = 640
 MAX_DETECTIONS = 300
 
@@ -149,33 +157,93 @@ def non_max_suppression(boxes, scores, iou_threshold):
     return keep
 
 
+def vegetation_fraction(image):
+    """Share of pixels with positive Excess Green (2G - R - B), on a thumbnail."""
+    small = np.asarray(image.resize((160, 160)), dtype=np.float32) / 255.0
+    r, g, b = small[..., 0], small[..., 1], small[..., 2]
+    return float(((2 * g - r - b) > 0.05).mean())
+
+
+def out_of_domain_reason(image, detections=None):
+    """Return why this is not a plantation canopy image, or None if it passes."""
+    veg = vegetation_fraction(image)
+    if veg < MIN_VEGETATION_FRACTION:
+        return f"vegetation {veg:.2f} < {MIN_VEGETATION_FRACTION}"
+    if detections is not None:
+        if len(detections) < MIN_DETECTIONS:
+            return f"{len(detections)} detections < {MIN_DETECTIONS}"
+        width, height = image.size
+        areas = [
+            (d["box"][2] - d["box"][0]) * (d["box"][3] - d["box"][1]) / (width * height)
+            for d in detections
+        ]
+        median_area = float(np.median(areas))
+        if median_area > MAX_MEDIAN_BOX_AREA:
+            return f"median box {median_area:.2f} > {MAX_MEDIAN_BOX_AREA}"
+    return None
+
+
+REJECT_MESSAGE = (
+    "This does not look like an arecanut plantation drone image, so no "
+    "analysis was run. Upload an aerial photo of the canopy."
+)
+
+
 def detect(image):
     """Run the model and return the surviving detections."""
     blob, scale, pad_x, pad_y = letterbox(image)
 
-    # YOLO11 emits (1, 4 + n_classes, 8400): xywh box then per-class scores.
-    raw = _session.run(None, {_input_name: blob})[0][0].T
-    class_scores = raw[:, 4:]
-    confidences = class_scores.max(axis=1)
-    class_ids = class_scores.argmax(axis=1)
+    output = _session.run(None, {_input_name: blob})[0][0]
 
-    # Each class clears its own threshold; healthy scores markedly lower than
-    # yld, so a single shared cut would silently drop it.
     thresholds = np.array([CLASS_THRESHOLDS[n] for n in CLASS_NAMES])
-    mask = confidences >= thresholds[class_ids]
-    if not mask.any():
-        return []
+    print(f"[detect] output shape {output.shape}", flush=True)
 
-    xywh = raw[mask, :4]
-    confidences = confidences[mask]
-    class_ids = class_ids[mask]
-
-    boxes = np.stack([
-        (xywh[:, 0] - xywh[:, 2] / 2 - pad_x) / scale,
-        (xywh[:, 1] - xywh[:, 3] / 2 - pad_y) / scale,
-        (xywh[:, 0] + xywh[:, 2] / 2 - pad_x) / scale,
-        (xywh[:, 1] + xywh[:, 3] / 2 - pad_y) / scale,
-    ], axis=1)
+    if output.ndim == 2 and output.shape[1] == 6:
+        # YOLO26 end-to-end export: (300, 6) = x1, y1, x2, y2, conf, class.
+        # Top-k is already baked into the graph; boxes are letterboxed xyxy.
+        confidences = output[:, 4]
+        class_ids = output[:, 5].astype(int)
+        print(
+            "[detect] top conf per class: "
+            + ", ".join(
+                f"{n}={confidences[class_ids == i].max(initial=0):.3f}"
+                for i, n in enumerate(CLASS_NAMES)
+            )
+            + f" (thresholds {CLASS_THRESHOLDS})",
+            flush=True,
+        )
+        # Each class clears its own threshold; healthy scores markedly lower
+        # than yld, so a single shared cut would silently drop it.
+        mask = confidences >= thresholds[class_ids]
+        if not mask.any():
+            return []
+        xyxy = output[mask, :4]
+        confidences = confidences[mask]
+        class_ids = class_ids[mask]
+        boxes = np.stack([
+            (xyxy[:, 0] - pad_x) / scale,
+            (xyxy[:, 1] - pad_y) / scale,
+            (xyxy[:, 2] - pad_x) / scale,
+            (xyxy[:, 3] - pad_y) / scale,
+        ], axis=1)
+    else:
+        # Legacy YOLO11 export: (4 + n_classes, 8400) = xywh then class scores.
+        raw = output.T
+        class_scores = raw[:, 4:]
+        confidences = class_scores.max(axis=1)
+        class_ids = class_scores.argmax(axis=1)
+        mask = confidences >= thresholds[class_ids]
+        if not mask.any():
+            return []
+        xywh = raw[mask, :4]
+        confidences = confidences[mask]
+        class_ids = class_ids[mask]
+        boxes = np.stack([
+            (xywh[:, 0] - xywh[:, 2] / 2 - pad_x) / scale,
+            (xywh[:, 1] - xywh[:, 3] / 2 - pad_y) / scale,
+            (xywh[:, 0] + xywh[:, 2] / 2 - pad_x) / scale,
+            (xywh[:, 1] + xywh[:, 3] / 2 - pad_y) / scale,
+        ], axis=1)
 
     width, height = image.size
     boxes[:, [0, 2]] = boxes[:, [0, 2]].clip(0, width - 1)
@@ -291,7 +359,15 @@ def analyse_upload(upload, camera_gps=None):
 
     filename = Path(upload.filename).name
     gps_source = filename.lower()
+    reason = out_of_domain_reason(image)
+    if reason:
+        print(f"[gate] rejected before inference: {reason}", flush=True)
+        raise ValueError(f"{REJECT_MESSAGE} [{reason}]")
     detections = detect(image)
+    reason = out_of_domain_reason(image, detections)
+    if reason:
+        print(f"[gate] rejected after inference: {reason}", flush=True)
+        raise ValueError(f"{REJECT_MESSAGE} [{reason}]")
     drone_gps = camera_gps or embedded_gps or GPS_DATA.get(gps_source)
     if drone_gps:
         for tree_id, detection in enumerate(detections, start=1):
@@ -396,6 +472,8 @@ def camera_response(upload):
         return jsonify({"error": "Could not read the camera frame."}), 400
 
     detections = detect(image)
+    if out_of_domain_reason(image, detections):
+        detections = []   # junk frame: report nothing rather than guesses
     return jsonify(
         {
             "detections": [
